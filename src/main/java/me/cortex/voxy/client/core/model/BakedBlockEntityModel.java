@@ -121,21 +121,30 @@ public class BakedBlockEntityModel {
 
     public static BakedBlockEntityModel bake(BlockState state) {
         Map<RenderLayer, BakedVertices> map = new HashMap<>();
-        var entity = ((BlockEntityProvider)state.getBlock()).createBlockEntity(BlockPos.ORIGIN, state);
-        if (entity == null) {
+        try {
+            var entity = ((BlockEntityProvider)state.getBlock()).createBlockEntity(BlockPos.ORIGIN, state);
+            if (entity == null) {
+                return null;
+            }
+            var renderer = MinecraftClient.getInstance().getBlockEntityRenderDispatcher().get(entity);
+            if (renderer != null) {
+                entity.setWorld(MinecraftClient.getInstance().world);
+                try {
+                    renderer.render(entity, 0.0f, new MatrixStack(), layer->map.computeIfAbsent(layer, BakedVertices::new), 0, 0);
+                } catch (Exception e) {
+                    System.err.println("Unable to bake block entity: " + entity + " (Block: " + state.getBlock() + ")");
+                    e.printStackTrace();
+                    // Return null to indicate this block entity cannot be baked
+                    return null;
+                }
+            }
+            entity.markRemoved();
+        } catch (Exception e) {
+            System.err.println("Failed to create or process block entity for state: " + state);
+            e.printStackTrace();
             return null;
         }
-        var renderer = MinecraftClient.getInstance().getBlockEntityRenderDispatcher().get(entity);
-        if (renderer != null) {
-            entity.setWorld(MinecraftClient.getInstance().world);
-            try {
-                renderer.render(entity, 0.0f, new MatrixStack(), layer->map.computeIfAbsent(layer, BakedVertices::new), 0, 0);
-            } catch (Exception e) {
-                System.err.println("Unable to bake block entity: " + entity);
-                e.printStackTrace();
-            }
-        }
-        entity.markRemoved();
+        
         if (map.isEmpty()) {
             return null;
         }

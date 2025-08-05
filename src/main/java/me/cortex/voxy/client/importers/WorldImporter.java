@@ -117,22 +117,30 @@ public class WorldImporter {
                     System.err.println("Unknown file: " + name);
                     continue;
                 }
-                int rx = Integer.parseInt(sections[1]);
-                int rz = Integer.parseInt(sections[2]);
-                this.totalRegions.addAndGet(1);
-                workers.submit(() -> {
-                    try {
-                        if (!isRunning) {
-                            return;
+                try {
+                    int rx = Integer.parseInt(sections[1]);
+                    int rz = Integer.parseInt(sections[2]);
+                    this.totalRegions.addAndGet(1);
+                    workers.submit(() -> {
+                        try {
+                            if (!isRunning) {
+                                return;
+                            }
+                            this.importRegionFile(file.toPath(), rx, rz);
+                            int regionsProcessedCount = this.regionsProcessed.addAndGet(1);
+                            updateCallback.update(regionsProcessedCount, this.totalRegions.get());
+                        } catch (Exception e) {
+                            System.err.println("Exception processing region file " + name + ":");
+                            e.printStackTrace();
+                            // Still update progress even if this region failed
+                            int regionsProcessedCount = this.regionsProcessed.addAndGet(1);
+                            updateCallback.update(regionsProcessedCount, this.totalRegions.get());
                         }
-                        this.importRegionFile(file.toPath(), rx, rz);
-                        int regionsProcessedCount = this.regionsProcessed.addAndGet(1);
-                        updateCallback.update(regionsProcessedCount, this.totalRegions.get());
-                    } catch (
-                            Exception e) {
-                        e.printStackTrace();
-                    }
-                });
+                    });
+                } catch (NumberFormatException e) {
+                    System.err.println("Invalid region file name format: " + name);
+                    continue;
+                }
             }
             workers.shutdown();
             try {
@@ -188,9 +196,17 @@ public class WorldImporter {
                                 if (decompressedData == null) {
                                     System.err.println("Error decompressing chunk data");
                                 } else {
-                                    var nbt = NbtIo.read(decompressedData);
-                                    this.importChunkNBT(nbt);
+                                    try {
+                                        var nbt = NbtIo.read(decompressedData);
+                                        this.importChunkNBT(nbt);
+                                    } catch (Exception e) {
+                                        System.err.println("Error reading or importing chunk NBT data");
+                                        e.printStackTrace();
+                                    }
                                 }
+                            } catch (Exception e) {
+                                System.err.println("Error decompressing chunk data");
+                                e.printStackTrace();
                             }
                         }
                     }
@@ -217,10 +233,21 @@ public class WorldImporter {
         try {
             int x = chunk.getInt("xPos");
             int z = chunk.getInt("zPos");
-            for (var sectionE : chunk.getList("sections", NbtElement.COMPOUND_TYPE)) {
-                var section = (NbtCompound) sectionE;
-                int y = section.getInt("Y");
-                this.importSectionNBT(x, y, z, section);
+            var sectionsList = chunk.getList("sections", NbtElement.COMPOUND_TYPE);
+            if (sectionsList == null) {
+                System.err.println("Chunk at " + x + ", " + z + " has no sections list");
+                return;
+            }
+            for (var sectionE : sectionsList) {
+                try {
+                    var section = (NbtCompound) sectionE;
+                    int y = section.getInt("Y");
+                    this.importSectionNBT(x, y, z, section);
+                } catch (Exception e) {
+                    System.err.println("Exception importing section in chunk " + x + ", " + z + ":");
+                    e.printStackTrace();
+                    // Continue with other sections
+                }
             }
         } catch (Exception e) {
             System.err.println("Exception importing world chunk:");
@@ -235,59 +262,71 @@ public class WorldImporter {
 
     private static final Codec<PalettedContainer<BlockState>> BLOCK_STATE_CODEC = PalettedContainer.createPalettedContainerCodec(Block.STATE_IDS, BlockState.CODEC, PalettedContainer.PaletteProvider.BLOCK_STATE, Blocks.AIR.getDefaultState());
     private void importSectionNBT(int x, int y, int z, NbtCompound section) {
-        if (section.getCompound("block_states").isEmpty()) {
-            return;
-        }
-
-        byte[] blockLightData = section.getByteArray("BlockLight");
-        byte[] skyLightData = section.getByteArray("SkyLight");
-
-        ChunkNibbleArray blockLight;
-        if (blockLightData.length != 0) {
-            blockLight = new ChunkNibbleArray(blockLightData);
-        } else {
-            blockLight = null;
-        }
-
-        ChunkNibbleArray skyLight;
-        if (skyLightData.length != 0) {
-            skyLight = new ChunkNibbleArray(skyLightData);
-        } else {
-            skyLight = null;
-        }
-
-        var blockStates = BLOCK_STATE_CODEC.parse(NbtOps.INSTANCE, section.getCompound("block_states")).result().get();
-        var biomes = this.biomeCodec.parse(NbtOps.INSTANCE, section.getCompound("biomes")).result().orElse(this.defaultBiomeProvider);
-        VoxelizedSection csec = WorldConversionFactory.convert(
-                this.world.getMapper(),
-                blockStates,
-                biomes,
-                (bx, by, bz, state) -> {
-                    int block = 0;
-                    int sky = 0;
-                    if (blockLight != null) {
-                        block = blockLight.get(bx, by, bz);
-                    }
-                    if (skyLight != null) {
-                        sky = skyLight.get(bx, by, bz);
-                    }
-                    sky = 15-sky;
-                    return (byte) (sky|(block<<4));
-                },
-                x,
-                y,
-                z
-        );
-
-        WorldConversionFactory.mipSection(csec, this.world.getMapper());
-
-        this.world.insertUpdate(csec);
-        while (this.world.savingService.getTaskCount() > 4000) {
-            try {
-                Thread.sleep(250);
-            } catch (InterruptedException e) {
-                throw new RuntimeException(e);
+        try {
+            if (section.getCompound("block_states").isEmpty()) {
+                return;
             }
+
+            byte[] blockLightData = section.getByteArray("BlockLight");
+            byte[] skyLightData = section.getByteArray("SkyLight");
+
+            ChunkNibbleArray blockLight;
+            if (blockLightData.length != 0) {
+                blockLight = new ChunkNibbleArray(blockLightData);
+            } else {
+                blockLight = null;
+            }
+
+            ChunkNibbleArray skyLight;
+            if (skyLightData.length != 0) {
+                skyLight = new ChunkNibbleArray(skyLightData);
+            } else {
+                skyLight = null;
+            }
+
+            try {
+                var blockStates = BLOCK_STATE_CODEC.parse(NbtOps.INSTANCE, section.getCompound("block_states")).result().get();
+                var biomes = this.biomeCodec.parse(NbtOps.INSTANCE, section.getCompound("biomes")).result().orElse(this.defaultBiomeProvider);
+                
+                VoxelizedSection csec = WorldConversionFactory.convert(
+                        this.world.getMapper(),
+                        blockStates,
+                        biomes,
+                        (bx, by, bz, state) -> {
+                            int block = 0;
+                            int sky = 0;
+                            if (blockLight != null) {
+                                block = blockLight.get(bx, by, bz);
+                            }
+                            if (skyLight != null) {
+                                sky = skyLight.get(bx, by, bz);
+                            }
+                            sky = 15-sky;
+                            return (byte) (sky|(block<<4));
+                        },
+                        x,
+                        y,
+                        z
+                );
+
+                WorldConversionFactory.mipSection(csec, this.world.getMapper());
+
+                this.world.insertUpdate(csec);
+                while (this.world.savingService.getTaskCount() > 4000) {
+                    try {
+                        Thread.sleep(250);
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("Error converting section at " + x + ", " + y + ", " + z + ": " + e.getMessage());
+                e.printStackTrace();
+                // Continue processing - don't let one bad section stop the whole import
+            }
+        } catch (Exception e) {
+            System.err.println("Fatal error processing section at " + x + ", " + y + ", " + z);
+            e.printStackTrace();
         }
     }
 

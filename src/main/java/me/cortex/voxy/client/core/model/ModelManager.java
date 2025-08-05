@@ -142,7 +142,9 @@ public class ModelManager {
 
 
     //TODO: what i need to do is seperate out fluid states from blockStates
-
+    
+    // Recursion protection to prevent infinite loops
+    private final Set<Integer> currentlyProcessing = new HashSet<>();
 
     //TODO: so need a few things, per face sizes and offsets, the sizes should be computed from the pixels and find the minimum bounding pixel
     // while the depth is computed from the depth buffer data
@@ -152,229 +154,250 @@ public class ModelManager {
             return this.idMappings[blockId];
         }
 
-        boolean isFluid = blockState.getBlock() instanceof FluidBlock;
-        int modelId = -1;
-        var textureData = this.bakery.renderFaces(blockState, 123456, isFluid);
-
-        int clientFluidStateId = -1;
-
-        if ((!isFluid) && (!blockState.getFluidState().isEmpty())) {
-            //Insert into the fluid LUT
-            var fluidState = blockState.getFluidState().getBlockState();
-
-            //TODO:FIXME: PASS IN THE Mapper instead of grabbing it!!! THIS IS CRTICIAL TO FIX
-            int fluidStateId = ((IGetVoxelCore)MinecraftClient.getInstance().worldRenderer).getVoxelCore().getWorldEngine().getMapper().getIdForBlockState(fluidState);
-
-
-            clientFluidStateId = this.idMappings[fluidStateId];
-            if (clientFluidStateId == -1) {
-                clientFluidStateId = this.addEntry(fluidStateId, fluidState);
-            }
+        // Check for recursion to prevent stack overflow
+        if (currentlyProcessing.contains(blockId)) {
+            System.err.println("Detected recursive call for blockId: " + blockId + " state: " + blockState);
+            // Return a safe default model ID, or create a minimal entry without fluid processing
+            this.idMappings[blockId] = 0; // Use air model as fallback
+            return 0;
         }
 
-        {//Deduplicate same entries
-            var entry = new ModelEntry(textureData, clientFluidStateId);
-            int possibleDuplicate = this.modelTexture2id.getInt(entry);
-            if (possibleDuplicate != -1) {//Duplicate found
-                this.idMappings[blockId] = possibleDuplicate;
-                modelId = possibleDuplicate;
-                return possibleDuplicate;
-            } else {//Not a duplicate so create a new entry
-                modelId = this.modelTexture2id.size();
-                this.idMappings[blockId] = modelId;
-                this.modelTexture2id.put(entry, modelId);
-            }
-        }
+        // Mark this block as being processed
+        currentlyProcessing.add(blockId);
+        
+        try {
+            boolean isFluid = blockState.getBlock() instanceof FluidBlock;
+            int modelId = -1;
+            var textureData = this.bakery.renderFaces(blockState, 123456, isFluid);
 
-        if (isFluid) {
-            this.fluidStateLUT[modelId] = modelId;
-        } else if (clientFluidStateId != -1) {
-            this.fluidStateLUT[modelId] = clientFluidStateId;
-        }
+            int clientFluidStateId = -1;
 
-        var colourProvider = MinecraftClient.getInstance().getBlockColors().providers.get(Registries.BLOCK.getRawId(blockState.getBlock()));
+            if ((!isFluid) && (!blockState.getFluidState().isEmpty())) {
+                //Insert into the fluid LUT
+                var fluidState = blockState.getFluidState().getBlockState();
 
+                //TODO:FIXME: PASS IN THE Mapper instead of grabbing it!!! THIS IS CRTICIAL TO FIX
+                int fluidStateId = ((IGetVoxelCore)MinecraftClient.getInstance().worldRenderer).getVoxelCore().getWorldEngine().getMapper().getIdForBlockState(fluidState);
 
-        RenderLayer blockRenderLayer = null;
-        if (blockState.getBlock() instanceof FluidBlock) {
-            blockRenderLayer = RenderLayers.getFluidLayer(blockState.getFluidState());
-        } else {
-            blockRenderLayer = RenderLayers.getBlockLayer(blockState);
-        }
-
-
-        int checkMode = blockRenderLayer==RenderLayer.getSolid()?TextureUtils.WRITE_CHECK_STENCIL:TextureUtils.WRITE_CHECK_ALPHA;
-
-
-
-
-        long uploadPtr = UploadStream.INSTANCE.upload(this.modelBuffer, (long) modelId * MODEL_SIZE, MODEL_SIZE);
-
-
-        //TODO: implement;
-        // TODO: if it has a constant colour instead... idk why (apparently for things like spruce leaves)?? but premultiply the texture data by the constant colour
-        boolean hasBiomeColourResolver = false;
-        if (colourProvider != null) {
-            hasBiomeColourResolver = isBiomeDependentColour(colourProvider, blockState);
-        }
-
-
-
-        //TODO: special case stuff like vines and glow lichen, where it can be represented by a single double sided quad
-        // since that would help alot with perf of lots of vines, can be done by having one of the faces just not exist and the other be in no occlusion mode
-
-        var sizes = this.computeModelDepth(textureData, checkMode);
-
-        //TODO: THIS, note this can be tested for in 2 ways, re render the model with quad culling disabled and see if the result
-        // is the same, (if yes then needs double sided quads)
-        // another way to test it is if e.g. up and down havent got anything rendered but the sides do (e.g. all plants etc)
-        boolean needsDoubleSidedQuads = (sizes[0] < -0.1 && sizes[1] < -0.1) || (sizes[2] < -0.1 && sizes[3] < -0.1) || (sizes[4] < -0.1 && sizes[5] < -0.1);
-
-
-        boolean cullsSame = false;
-
-        {
-            //TODO: Could also move this into the RenderDataFactory and do it on the actual blockstates instead of a guestimation
-            boolean allTrue = true;
-            boolean allFalse = true;
-            //Guestimation test for if the block culls itself
-            for (var dir : Direction.values()) {
-                if (blockState.isSideInvisible(blockState, dir)) {
-                    allFalse = false;
-                } else {
-                    allTrue = false;
+                clientFluidStateId = this.idMappings[fluidStateId];
+                if (clientFluidStateId == -1) {
+                    // Check if we're already processing this fluid state to prevent recursion
+                    if (!currentlyProcessing.contains(fluidStateId)) {
+                        clientFluidStateId = this.addEntry(fluidStateId, fluidState);
+                    } else {
+                        System.err.println("Prevented recursive fluid state processing for blockId: " + blockId + " fluidStateId: " + fluidStateId);
+                        clientFluidStateId = 0; // Use default/air model for fluid
+                    }
                 }
             }
 
-            if (allFalse == allTrue) {//If only some sides where self culled then abort
-                cullsSame = false;
-                if (LOGGED_SELF_CULLING_WARNING.add(blockState)) System.err.println("Warning! blockstate: " + blockState + " only culled against its self some of the time");
+            {//Deduplicate same entries
+                var entry = new ModelEntry(textureData, clientFluidStateId);
+                int possibleDuplicate = this.modelTexture2id.getInt(entry);
+                if (possibleDuplicate != -1) {//Duplicate found
+                    this.idMappings[blockId] = possibleDuplicate;
+                    modelId = possibleDuplicate;
+                    return possibleDuplicate;
+                } else {//Not a duplicate so create a new entry
+                    modelId = this.modelTexture2id.size();
+                    this.idMappings[blockId] = modelId;
+                    this.modelTexture2id.put(entry, modelId);
+                }
             }
 
-            if (allTrue) {
-                cullsSame = true;
+            if (isFluid) {
+                this.fluidStateLUT[modelId] = modelId;
+            } else if (clientFluidStateId != -1) {
+                this.fluidStateLUT[modelId] = clientFluidStateId;
             }
+
+            var colourProvider = MinecraftClient.getInstance().getBlockColors().providers.get(Registries.BLOCK.getRawId(blockState.getBlock()));
+
+
+            RenderLayer blockRenderLayer = null;
+            if (blockState.getBlock() instanceof FluidBlock) {
+                blockRenderLayer = RenderLayers.getFluidLayer(blockState.getFluidState());
+            } else {
+                blockRenderLayer = RenderLayers.getBlockLayer(blockState);
+            }
+
+
+            int checkMode = blockRenderLayer==RenderLayer.getSolid()?TextureUtils.WRITE_CHECK_STENCIL:TextureUtils.WRITE_CHECK_ALPHA;
+
+
+
+
+            long uploadPtr = UploadStream.INSTANCE.upload(this.modelBuffer, (long) modelId * MODEL_SIZE, MODEL_SIZE);
+
+
+            //TODO: implement;
+            // TODO: if it has a constant colour instead... idk why (apparently for things like spruce leaves)?? but premultiply the texture data by the constant colour
+            boolean hasBiomeColourResolver = false;
+            if (colourProvider != null) {
+                hasBiomeColourResolver = isBiomeDependentColour(colourProvider, blockState);
+            }
+
+
+
+            //TODO: special case stuff like vines and glow lichen, where it can be represented by a single double sided quad
+            // since that would help alot with perf of lots of vines, can be done by having one of the faces just not exist and the other be in no occlusion mode
+
+            var sizes = this.computeModelDepth(textureData, checkMode);
+
+            //TODO: THIS, note this can be tested for in 2 ways, re render the model with quad culling disabled and see if the result
+            // is the same, (if yes then needs double sided quads)
+            // another way to test it is if e.g. up and down havent got anything rendered but the sides do (e.g. all plants etc)
+            boolean needsDoubleSidedQuads = (sizes[0] < -0.1 && sizes[1] < -0.1) || (sizes[2] < -0.1 && sizes[3] < -0.1) || (sizes[4] < -0.1 && sizes[5] < -0.1);
+
+
+            boolean cullsSame = false;
+
+            {
+                //TODO: Could also move this into the RenderDataFactory and do it on the actual blockstates instead of a guestimation
+                boolean allTrue = true;
+                boolean allFalse = true;
+                //Guestimation test for if the block culls itself
+                for (var dir : Direction.values()) {
+                    if (blockState.isSideInvisible(blockState, dir)) {
+                        allFalse = false;
+                    } else {
+                        allTrue = false;
+                    }
+                }
+
+                if (allFalse == allTrue) {//If only some sides where self culled then abort
+                    cullsSame = false;
+                    if (LOGGED_SELF_CULLING_WARNING.add(blockState)) System.err.println("Warning! blockstate: " + blockState + " only culled against its self some of the time");
+                }
+
+                if (allTrue) {
+                    cullsSame = true;
+                }
+            }
+
+
+            //Each face gets 1 byte, with the top 2 bytes being for whatever
+            long metadata = 0;
+            metadata |= hasBiomeColourResolver?1:0;
+            metadata |= blockRenderLayer == RenderLayer.getTranslucent()?2:0;
+            metadata |= needsDoubleSidedQuads?4:0;
+            metadata |= (!blockState.getFluidState().isEmpty())?8:0;//Has a fluid state accosiacted with it
+            metadata |= isFluid?16:0;//Is a fluid
+
+            metadata |= cullsSame?32:0;
+
+            //TODO: add a bunch of control config options for overriding/setting options of metadata for each face of each type
+            for (int face = 5; face != -1; face--) {//In reverse order to make indexing into the metadata long easier
+                long faceUploadPtr = uploadPtr + 4L * face;//Each face gets 4 bytes worth of data
+                metadata <<= 8;
+                float offset = sizes[face];
+                if (offset < -0.1) {//Face is empty, so ignore
+                    metadata |= 0xFF;//Mark the face as non-existent
+                    //Set to -1 as safepoint
+                    MemoryUtil.memPutInt(faceUploadPtr, -1);
+                    continue;
+                }
+                var faceSize = TextureUtils.computeBounds(textureData[face], checkMode);
+                int writeCount = TextureUtils.getWrittenPixelCount(textureData[face], checkMode);
+
+                boolean faceCoversFullBlock = faceSize[0] == 0 && faceSize[2] == 0 &&
+                        faceSize[1] == (this.modelTextureSize-1) && faceSize[3] == (this.modelTextureSize-1);
+
+                metadata |= faceCoversFullBlock?2:0;
+
+                //TODO: add alot of config options for the following
+                boolean occludesFace = true;
+                occludesFace &= blockRenderLayer != RenderLayer.getTranslucent();//If its translucent, it doesnt occlude
+
+                //TODO: make this an option, basicly if the face is really close, it occludes otherwise it doesnt
+                occludesFace &= offset < 0.1;//If the face is rendered far away from the other face, then it doesnt occlude
+
+                if (occludesFace) {
+                    occludesFace &= ((float)writeCount)/(this.modelTextureSize * this.modelTextureSize) > 0.9;// only occlude if the face covers more than 90% of the face
+                }
+                metadata |= occludesFace?1:0;
+
+
+
+                boolean canBeOccluded = true;
+                //TODO: make this an option on how far/close
+                canBeOccluded &= offset < 0.3;//If the face is rendered far away from the other face, then it cant be occluded
+
+                metadata |= canBeOccluded?4:0;
+
+                //Face uses its own lighting if its not flat against the adjacent block & isnt traslucent
+                metadata |= (offset != 0 || blockRenderLayer == RenderLayer.getTranslucent())?0b1000:0;
+
+
+
+                //Scale face size from 0->this.modelTextureSize-1 to 0->15
+                for (int i = 0; i < 4; i++) {
+                    faceSize[i] = Math.round((((float)faceSize[i])/(this.modelTextureSize-1))*15);
+                }
+
+                int faceModelData = 0;
+                faceModelData |= faceSize[0] | (faceSize[1]<<4) | (faceSize[2]<<8) | (faceSize[3]<<12);
+                faceModelData |= Math.round(offset*63)<<16;//Change the scale from 0->1 (ends inclusive) float to 0->63 (6 bits) NOTE! that 63 == 1.0f meaning its shifted all the way to the other side of the model
+                //Still have 11 bits free
+
+                //Stuff like fences are solid, however they have extra side piece that mean it needs to have discard on
+                int area = (faceSize[1]-faceSize[0]+1) * (faceSize[3]-faceSize[2]+1);
+                boolean needsAlphaDiscard = ((float)writeCount)/area<0.9;//If the amount of area covered by written pixels is less than a threashold, disable discard as its not needed
+
+                needsAlphaDiscard |= blockRenderLayer != RenderLayer.getSolid();
+                needsAlphaDiscard &= blockRenderLayer != RenderLayer.getTranslucent();//Translucent doesnt have alpha discard
+                faceModelData |= needsAlphaDiscard?1<<22:0;
+
+                faceModelData |= ((!faceCoversFullBlock)&&blockRenderLayer != RenderLayer.getTranslucent())?1<<23:0;//Alpha discard override, translucency doesnt have alpha discard
+
+
+
+                MemoryUtil.memPutInt(faceUploadPtr, faceModelData);
+            }
+            this.metadataCache[modelId] = metadata;
+
+            uploadPtr += 4*6;
+            //Have 40 bytes free for remaining model data
+            // todo: put in like the render layer type ig? along with colour resolver info
+            int modelFlags = 0;
+            modelFlags |= colourProvider != null?1:0;
+            modelFlags |= hasBiomeColourResolver?2:0;//Basicly whether to use the next int as a colour or as a base index/id into a colour buffer for biome dependent colours
+            modelFlags |= blockRenderLayer == RenderLayer.getTranslucent()?4:0;
+            modelFlags |= blockRenderLayer == RenderLayer.getCutout()?0:8;
+
+            //modelFlags |= blockRenderLayer == RenderLayer.getSolid()?0:1;// should discard alpha
+            MemoryUtil.memPutInt(uploadPtr, modelFlags);
+            //Temporary override to always be non biome specific
+            if (colourProvider == null) {
+                MemoryUtil.memPutInt(uploadPtr + 4, -1);//Set the default to nothing so that its faster on the gpu
+            } else if (!hasBiomeColourResolver) {
+                Biome defaultBiome = MinecraftClient.getInstance().world.getRegistryManager().get(RegistryKeys.BIOME).get(BiomeKeys.PLAINS);
+                MemoryUtil.memPutInt(uploadPtr + 4, captureColourConstant(colourProvider, blockState, defaultBiome)|0xFF000000);
+            } else if (!this.biomes.isEmpty()) {
+                //Populate the list of biomes for the model state
+                int biomeIndex = this.modelsRequiringBiomeColours.size() * this.biomes.size();
+                MemoryUtil.memPutInt(uploadPtr + 4, biomeIndex);
+                this.modelsRequiringBiomeColours.add(new Pair<>(modelId, blockState));
+                long clrUploadPtr = UploadStream.INSTANCE.upload(this.modelColourBuffer, biomeIndex * 4L, 4L * this.biomes.size());
+                for (var biome : this.biomes) {
+                    MemoryUtil.memPutInt(clrUploadPtr, captureColourConstant(colourProvider, blockState, biome)|0xFF000000); clrUploadPtr += 4;
+                }
+            }
+
+
+            //Note: if the layer isSolid then need to fill all the points in the texture where alpha == 0 with the average colour
+            // of the surrounding blocks but only within the computed face size bounds
+            //TODO
+
+
+            this.putTextures(modelId, textureData);
+
+            //glGenerateTextureMipmap(this.textures.id);
+            return modelId;
+        } finally {
+            // Always remove from processing set, even if an exception occurs
+            currentlyProcessing.remove(blockId);
         }
-
-
-        //Each face gets 1 byte, with the top 2 bytes being for whatever
-        long metadata = 0;
-        metadata |= hasBiomeColourResolver?1:0;
-        metadata |= blockRenderLayer == RenderLayer.getTranslucent()?2:0;
-        metadata |= needsDoubleSidedQuads?4:0;
-        metadata |= (!blockState.getFluidState().isEmpty())?8:0;//Has a fluid state accosiacted with it
-        metadata |= isFluid?16:0;//Is a fluid
-
-        metadata |= cullsSame?32:0;
-
-        //TODO: add a bunch of control config options for overriding/setting options of metadata for each face of each type
-        for (int face = 5; face != -1; face--) {//In reverse order to make indexing into the metadata long easier
-            long faceUploadPtr = uploadPtr + 4L * face;//Each face gets 4 bytes worth of data
-            metadata <<= 8;
-            float offset = sizes[face];
-            if (offset < -0.1) {//Face is empty, so ignore
-                metadata |= 0xFF;//Mark the face as non-existent
-                //Set to -1 as safepoint
-                MemoryUtil.memPutInt(faceUploadPtr, -1);
-                continue;
-            }
-            var faceSize = TextureUtils.computeBounds(textureData[face], checkMode);
-            int writeCount = TextureUtils.getWrittenPixelCount(textureData[face], checkMode);
-
-            boolean faceCoversFullBlock = faceSize[0] == 0 && faceSize[2] == 0 &&
-                    faceSize[1] == (this.modelTextureSize-1) && faceSize[3] == (this.modelTextureSize-1);
-
-            metadata |= faceCoversFullBlock?2:0;
-
-            //TODO: add alot of config options for the following
-            boolean occludesFace = true;
-            occludesFace &= blockRenderLayer != RenderLayer.getTranslucent();//If its translucent, it doesnt occlude
-
-            //TODO: make this an option, basicly if the face is really close, it occludes otherwise it doesnt
-            occludesFace &= offset < 0.1;//If the face is rendered far away from the other face, then it doesnt occlude
-
-            if (occludesFace) {
-                occludesFace &= ((float)writeCount)/(this.modelTextureSize * this.modelTextureSize) > 0.9;// only occlude if the face covers more than 90% of the face
-            }
-            metadata |= occludesFace?1:0;
-
-
-
-            boolean canBeOccluded = true;
-            //TODO: make this an option on how far/close
-            canBeOccluded &= offset < 0.3;//If the face is rendered far away from the other face, then it cant be occluded
-
-            metadata |= canBeOccluded?4:0;
-
-            //Face uses its own lighting if its not flat against the adjacent block & isnt traslucent
-            metadata |= (offset != 0 || blockRenderLayer == RenderLayer.getTranslucent())?0b1000:0;
-
-
-
-            //Scale face size from 0->this.modelTextureSize-1 to 0->15
-            for (int i = 0; i < 4; i++) {
-                faceSize[i] = Math.round((((float)faceSize[i])/(this.modelTextureSize-1))*15);
-            }
-
-            int faceModelData = 0;
-            faceModelData |= faceSize[0] | (faceSize[1]<<4) | (faceSize[2]<<8) | (faceSize[3]<<12);
-            faceModelData |= Math.round(offset*63)<<16;//Change the scale from 0->1 (ends inclusive) float to 0->63 (6 bits) NOTE! that 63 == 1.0f meaning its shifted all the way to the other side of the model
-            //Still have 11 bits free
-
-            //Stuff like fences are solid, however they have extra side piece that mean it needs to have discard on
-            int area = (faceSize[1]-faceSize[0]+1) * (faceSize[3]-faceSize[2]+1);
-            boolean needsAlphaDiscard = ((float)writeCount)/area<0.9;//If the amount of area covered by written pixels is less than a threashold, disable discard as its not needed
-
-            needsAlphaDiscard |= blockRenderLayer != RenderLayer.getSolid();
-            needsAlphaDiscard &= blockRenderLayer != RenderLayer.getTranslucent();//Translucent doesnt have alpha discard
-            faceModelData |= needsAlphaDiscard?1<<22:0;
-
-            faceModelData |= ((!faceCoversFullBlock)&&blockRenderLayer != RenderLayer.getTranslucent())?1<<23:0;//Alpha discard override, translucency doesnt have alpha discard
-
-
-
-            MemoryUtil.memPutInt(faceUploadPtr, faceModelData);
-        }
-        this.metadataCache[modelId] = metadata;
-
-        uploadPtr += 4*6;
-        //Have 40 bytes free for remaining model data
-        // todo: put in like the render layer type ig? along with colour resolver info
-        int modelFlags = 0;
-        modelFlags |= colourProvider != null?1:0;
-        modelFlags |= hasBiomeColourResolver?2:0;//Basicly whether to use the next int as a colour or as a base index/id into a colour buffer for biome dependent colours
-        modelFlags |= blockRenderLayer == RenderLayer.getTranslucent()?4:0;
-        modelFlags |= blockRenderLayer == RenderLayer.getCutout()?0:8;
-
-        //modelFlags |= blockRenderLayer == RenderLayer.getSolid()?0:1;// should discard alpha
-        MemoryUtil.memPutInt(uploadPtr, modelFlags);
-        //Temporary override to always be non biome specific
-        if (colourProvider == null) {
-            MemoryUtil.memPutInt(uploadPtr + 4, -1);//Set the default to nothing so that its faster on the gpu
-        } else if (!hasBiomeColourResolver) {
-            Biome defaultBiome = MinecraftClient.getInstance().world.getRegistryManager().get(RegistryKeys.BIOME).get(BiomeKeys.PLAINS);
-            MemoryUtil.memPutInt(uploadPtr + 4, captureColourConstant(colourProvider, blockState, defaultBiome)|0xFF000000);
-        } else if (!this.biomes.isEmpty()) {
-            //Populate the list of biomes for the model state
-            int biomeIndex = this.modelsRequiringBiomeColours.size() * this.biomes.size();
-            MemoryUtil.memPutInt(uploadPtr + 4, biomeIndex);
-            this.modelsRequiringBiomeColours.add(new Pair<>(modelId, blockState));
-            long clrUploadPtr = UploadStream.INSTANCE.upload(this.modelColourBuffer, biomeIndex * 4L, 4L * this.biomes.size());
-            for (var biome : this.biomes) {
-                MemoryUtil.memPutInt(clrUploadPtr, captureColourConstant(colourProvider, blockState, biome)|0xFF000000); clrUploadPtr += 4;
-            }
-        }
-
-
-        //Note: if the layer isSolid then need to fill all the points in the texture where alpha == 0 with the average colour
-        // of the surrounding blocks but only within the computed face size bounds
-        //TODO
-
-
-        this.putTextures(modelId, textureData);
-
-        //glGenerateTextureMipmap(this.textures.id);
-        return modelId;
     }
 
     public void addBiome(int id, Biome biome) {
